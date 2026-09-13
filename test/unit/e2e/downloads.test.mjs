@@ -25,10 +25,12 @@ const {
   downloadDir,
   downloadTo,
   isFileLockError,
+  nsisPortableArgs,
   parseFirefoxVersion,
   portableBinaryPath,
   resolveDownloadUrl,
   runInstallerWithRetry,
+  runNsisInstallerWithRetry,
 } = await import(downloadsUrl);
 
 // ── resolveDownloadUrl ────────────────────────────────────────────────────
@@ -72,6 +74,42 @@ test('dmg app names match the browser discovery registry (space-safe volumes)', 
     // BROWSERS[browser].mac[0] under /Applications — the two must agree.
     assert.equal(recipe.app, BROWSERS[browser].mac[0]);
   }
+});
+
+// ── Fork portable recipes (#38 pre-1.0) ────────────────────────────────
+// The three NSIS fork installers (zen, floorp, waterfox) declare portable
+// capability; the portable path routes through installForkPortable, which
+// needs the exe name and the NSIS /D= argv.
+
+test('fork portable: NSIS win recipes declare portable + exe name', () => {
+  for (const [browser, exe] of [
+    ['zen', 'zen.exe'],
+    ['floorp', 'floorp.exe'],
+    ['waterfox', 'waterfox.exe'],
+  ]) {
+    const recipe = DOWNLOADS[browser]?.install?.win;
+    assert.ok(recipe, `${browser} needs a win recipe`);
+    assert.equal(recipe.portable, true, `${browser} must declare portable: true`);
+    assert.equal(recipe.portableExe, exe, `${browser} portableExe`);
+    assert.ok(recipe.args?.includes('/S'), `${browser} keeps its registered /S args`);
+    assert.ok(recipe.url || recipe.resolver, `${browser} must have url or resolver`);
+  }
+});
+
+test('nsisPortableArgs: /S then the final /D= (NSIS consumes the rest)', () => {
+  assert.deepEqual(nsisPortableArgs('C:\\temp\\fxs'), ['/S', '/D=C:\\temp\\fxs']);
+  assert.equal(nsisPortableArgs('C:/x y')[1], '/D=C:/x y', 'spaces ride inside /D=');
+});
+
+test('resolveDownloadUrl: fork win URLs stay the registered installers (cache-key parity)', async () => {
+  // The fork-portable legs cache the download under the same URL the
+  // registered install uses — the portable path must not change --url output.
+  assert.match(await resolveDownloadUrl('zen', 'win32'), /zen\.installer\.exe$/);
+  assert.match(
+    await resolveDownloadUrl('floorp', 'win32'),
+    /floorp-windows-x86_64\.installer\.exe$/
+  );
+  assert.match(await resolveDownloadUrl('waterfox', 'win32'), /Waterfox(Setup|%20Setup)/);
 });
 
 test('resolveDownloadUrl: accepts short platform names (win/mac)', async () => {
@@ -500,6 +538,70 @@ test('isFileLockError: matches the AV signatures, only on Windows', () => {
     false
   );
   assert.equal(isFileLockError(null), false);
+});
+
+test('isFileLockError: spawnSync-shape EBUSY (libuv sharing violation) matches on Windows', () => {
+  // spawnSync failures surface as {error: Error with code EBUSY} — the same
+  // os error 32 sharing violation, different shape than execSync's stderr.
+  const err = Object.assign(new Error('spawn EBUSY'), {code: 'EBUSY'});
+  assert.equal(isFileLockError(err, {platform: 'win32'}), true);
+  assert.equal(isFileLockError(err, {platform: 'linux'}), false);
+  // A non-lock spawn error (e.g. ENOENT for a missing exe) must not match.
+  assert.equal(
+    isFileLockError(Object.assign(new Error('spawn ENOENT'), {code: 'ENOENT'}), {
+      platform: 'win32',
+    }),
+    false
+  );
+});
+
+test('runNsisInstallerWithRetry: retries spawnSync EBUSY then succeeds', () => {
+  const attempts = [];
+  const result = runNsisInstallerWithRetry('setup.exe', ['/S', '/D=C:\\x'], 'test installer', {
+    spawn: (exe, args) => {
+      attempts.push([exe, args]);
+      if (attempts.length < 3) {
+        return {error: Object.assign(new Error('spawn EBUSY'), {code: 'EBUSY'})};
+      }
+      return {status: 0};
+    },
+    sleep: () => {},
+  });
+  assert.equal(result.status, 0);
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(attempts[0][1], ['/S', '/D=C:\\x'], 'args passed through verbatim');
+});
+
+test('runNsisInstallerWithRetry: rethrows a real installer failure (non-zero exit)', () => {
+  let attempts = 0;
+  assert.throws(
+    () =>
+      runNsisInstallerWithRetry('setup.exe', ['/S'], 'test installer', {
+        spawn: () => {
+          attempts += 1;
+          return {status: 1627};
+        },
+        sleep: () => assert.fail('must not sleep'),
+      }),
+    /exited with code 1627/
+  );
+  assert.equal(attempts, 1, 'non-lock failure must not be retried');
+});
+
+test('runNsisInstallerWithRetry: gives up after the last attempt (persistent EBUSY)', () => {
+  let attempts = 0;
+  assert.throws(
+    () =>
+      runNsisInstallerWithRetry('setup.exe', ['/S'], 'test installer', {
+        spawn: () => {
+          attempts += 1;
+          return {error: Object.assign(new Error('spawn EBUSY'), {code: 'EBUSY'})};
+        },
+        sleep: () => {},
+      }),
+    /EBUSY/
+  );
+  assert.equal(attempts, 4, 'default attempts = 4');
 });
 
 // ── portableBinaryPath (extracted-portable cache, A1) ───────────────────
