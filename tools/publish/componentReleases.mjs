@@ -53,6 +53,115 @@ export function scriptsTag(date) {
 /** Tag for the installer+helper component release. */
 export function installerTag(date) {
   return `installer-${date}`;
+}
+
+/**
+ * The managed self-update block embedded in an installer-<date> release body
+ * (ADR 0019 amendment, date-based self-update): the installer tab ingests the
+ * newest installer-<date> body, and the C side parses this block for the build
+ * date and this platform's download URL. The block is wrapped in a
+ *
+ * ```json
+ * keys, so the fence is opaque to it.
+ *
+ * `urlByAsset` maps installer asset name → browser_download_url under the
+ * permanently-named `latest` tag (entries missing for platforms this run did
+ * not rebuild — the installer falls back to the releases page for those).
+ *
+ * @param {string} date YYYY-MM-DD (must match config/installer.conf
+ *   BUILD_DATE for the binaries this publish ships — that equality is what
+ *   makes the C-side strcmp comparison converge)
+ * @param {Record<string, string>} urlByAsset asset name → download URL
+ * @returns {string} JSON block, no fence
+ * ```
+ */
+export function renderSelfUpdateBlock(date, urlByAsset) {
+  return JSON.stringify({installerDate: date, download: urlByAsset});
+}
+
+/**
+ * Managed self-update block from an existing release body, for merging (a
+ * same-day republish keeps the URLs an earlier run recorded for platforms it
+ * did rebuild — see mergeSelfUpdateBlock).
+ *
+ * @param {string} body prior release body
+ * @returns {{
+ *   installerDate?: string;
+ *   download?: Record<string, string>;
+ * } | null}
+ */
+export function parseSelfUpdateBlock(body) {
+  if (!body) return null;
+  /** Balanced-brace JSON object starting at `start` (an opening brace). */
+  const extractObject = start => {
+    let depth = 0;
+    for (let i = start; i < body.length; i++) {
+      if (body[i] === '{') {
+        depth++;
+        if (depth === 1) start = i;
+      } else if (body[i] === '}') {
+        depth--;
+        if (depth === 0) return body.slice(start, i + 1);
+      }
+    }
+    return null;
+  };
+  const keyAt = body.indexOf('"installerDate"');
+  if (keyAt === -1) return null;
+  // The block sits in a ```json fence in normal bodies; a bare occurrence
+  // (body embedded as a plain JSON string value, unescaped by GitHub's API)
+  // is accepted too.  Walk BACKWARDS from the key to the block's opening
+  // brace (the key sits above the nested download map, so a forward scan
+  // from the key itself would latch onto the inner brace), then extract the
+  // balanced object — a regex `[^{}]*` would truncate the map and same-day
+  // merges would lose prior platforms' URLs.
+  let openAt = -1;
+  let depth = 0;
+  for (let i = keyAt; i >= 0; i--) {
+    if (body[i] === '}') depth++;
+    else if (body[i] === '{') {
+      if (depth === 0) {
+        openAt = i;
+        break;
+      }
+      depth--;
+    }
+  }
+  const fencedAt = body.lastIndexOf('```json', keyAt);
+  const candidates = [];
+  if (fencedAt !== -1) {
+    const fenceEnd = body.indexOf('```', fencedAt + 7);
+    if (fenceEnd !== -1) candidates.push(body.slice(fencedAt + 7, fenceEnd));
+  }
+  candidates.push(openAt === -1 ? null : extractObject(openAt));
+  for (const c of candidates) {
+    if (!c) continue;
+    try {
+      const parsed = JSON.parse(c);
+      if (parsed && typeof parsed.installerDate === 'string') return parsed;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge this run's download URLs over a prior block (same-day tag reuse): this
+ * run's entries win, prior entries for platforms this run did not rebuild
+ * survive. The date always comes from this run.
+ *
+ * @param {string} date this run's YYYY-MM-DD
+ * @param {Record<string, string>} urlByAsset this run's asset → URL map
+ * @param {{
+ *   installerDate?: string;
+ *   download?: Record<string, string>;
+ * } | null} prior
+ * @returns {Record<string, string>} merged asset → URL map
+ */
+export function mergeSelfUpdateBlock(date, urlByAsset, prior) {
+  const merged = {...(prior && prior.installerDate === date ? prior.download : {}), ...urlByAsset};
+  return merged;
 } /**
  * Group the built artifacts into component-release buckets.
  *
@@ -108,19 +217,25 @@ export function componentAssets(installer, built, access) {
  *
  * `dates` maps asset name → YYYY-MM-DD (per-package source-commit date from the
  * manifest; defaults to the release's own date).
+ *
+ * For installer releases `selfUpdateBlock` (the managed JSON block from
+ * renderSelfUpdateBlock) is appended in a ```json fence — the machine-readable
+ * payload the installer's date-based self-update ingests (ADR 0019 amendment).
  */
-export function renderComponentBody(kind, date, names, dates = {}) {
+export function renderComponentBody(kind, date, names, dates = {}, selfUpdateBlock = '') {
   const base = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases`;
   const title = kind === 'scripts' ? 'Package zips (utils, fx-folder)' : 'Installer binaries';
   const list =
     names.length > 0 ?
       names.map(n => `- ${n} — updated ${dates[n] || date}`).join('\n')
     : '- (no artifacts this date)';
+  const managed = selfUpdateBlock ? `\n\n\`\`\`json\n${selfUpdateBlock}\n\`\`\`\n` : '';
   return (
     `${title} — ${date}.\n\n` +
     `${list}\n\n` +
     `This release is an archived snapshot: the files above are from that date and will not ` +
-    `change. Always download the newest files from the [Latest Scripts release](${base}/latest).`
+    `change. Always download the newest files from the [Latest Scripts release](${base}/latest).` +
+    managed
   );
 }
 
@@ -163,14 +278,35 @@ export async function syncComponentRelease(
   tagName,
   date,
   assets,
-  {kind, dates = {}} = {}
+  {kind, dates = {}, selfUpdateUrlByAsset = null} = {}
 ) {
   const {getRelease, getOrCreateRelease, deleteExistingAsset, uploadAsset, uploadAssetBuffer} =
     await import('./uploadUtilsZip.mjs');
   const existed = !!(await getRelease(octokit, tagName));
+
+  // Managed self-update block (installer releases only): merge this run's
+  // download URLs over the prior same-day body so entries for platforms an
+  // earlier run rebuilt survive (same-day tag reuse).
+  let selfUpdateBlock = '';
+  if (kind === 'installer' && selfUpdateUrlByAsset) {
+    let prior = null;
+    if (existed) {
+      try {
+        const current = await getRelease(octokit, tagName);
+        prior = parseSelfUpdateBlock(current?.body);
+      } catch {
+        prior = null; // under-merge rather than fail the sync
+      }
+    }
+    selfUpdateBlock = renderSelfUpdateBlock(
+      date,
+      mergeSelfUpdateBlock(date, selfUpdateUrlByAsset, prior)
+    );
+  }
+
   const release = await getOrCreateRelease(octokit, tagName, {
     name: `${kind === 'scripts' ? 'Scripts' : 'Installer'} — ${date}`,
-    body: renderComponentBody(kind, date, [...assets.keys()], dates),
+    body: renderComponentBody(kind, date, [...assets.keys()], dates, selfUpdateBlock),
     commitish: 'main',
     prerelease: false,
   });
@@ -206,7 +342,13 @@ export async function syncComponentRelease(
     owner: REPO_OWNER,
     repo: REPO_NAME,
     release_id: release.id,
-    body: renderComponentBody(kind, date, bodyAssetNames([...assets.keys()], priorNames), dates),
+    body: renderComponentBody(
+      kind,
+      date,
+      bodyAssetNames([...assets.keys()], priorNames),
+      dates,
+      selfUpdateBlock
+    ),
   });
   console.log(green(`  ✓ component release ${tagName} synced`));
   return {created: !existed};
@@ -264,11 +406,32 @@ export async function pinLatestRelease(octokit) {
  */
 export async function syncComponentReleases(
   octokit,
-  {builtZips, builtInstallers, builtHelpers, manifest, zipPath, installerPath}
+  {
+    builtZips,
+    builtInstallers,
+    builtHelpers,
+    manifest,
+    zipPath,
+    installerPath,
+    installerDate: installerBuiltDate,
+  }
 ) {
   try {
     const {installerAssetName} = await import('./platforms.mjs');
     const date = componentDate();
+    // Installer bucket date: conf BUILD_DATE (passed through by upload.mjs),
+    // never the clock.  The binaries this run publishes bake that exact
+    // string (CFG_BUILD_DATE) and the C self-update compares against it — a
+    // clock date here would publish a tag whose managed installerDate
+    // disagrees with the binaries under it.  Falls back to the manifest's
+    // per-package source-commit date (local/tests), then the release date.
+    const installerDate = installerBuiltDate ?? (manifest.installer?.date || date);
+    if (installerBuiltDate !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(installerBuiltDate)) {
+      throw new Error(
+        `config/installer.conf BUILD_DATE '${installerBuiltDate}' is not YYYY-MM-DD — ` +
+          `fix the conf before publishing installers (the self-update date compare depends on it).`
+      );
+    }
     const {scripts, installer} = groupBuilt({builtZips, builtInstallers, builtHelpers});
     if (scripts.length === 0 && installer.length === 0) {
       console.log(dim('  component releases: nothing rebuilt — date tags unchanged'));
@@ -302,9 +465,21 @@ export async function syncComponentReleases(
         console.log(dim('  component releases: installer bucket empty — date tag unchanged'));
         return;
       }
-      await syncComponentRelease(octokit, installerTag(date), date, assets, {
+      // Managed self-update URLs (ADR 0019 amendment): every rebuilt asset
+      // points at its permanent `latest`-tag download URL.
+      const downloadBase = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download`;
+      const selfUpdateUrlByAsset = {};
+      // The managed URL intentionally targets the `latest` RELEASE download
+      // (the user-facing artifact; the banner downloads via an anchor click
+      // and needs no CORS).  The gh-pages mirror exists for any future
+      // fetch-based flow, not as the banner's target.
+      for (const assetName of assets.keys()) {
+        selfUpdateUrlByAsset[assetName] = `${downloadBase}/latest/${assetName}`;
+      }
+      await syncComponentRelease(octokit, installerTag(installerDate), installerDate, assets, {
         kind: 'installer',
         dates,
+        selfUpdateUrlByAsset,
       });
     }
   } catch (err) {
