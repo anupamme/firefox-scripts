@@ -180,13 +180,12 @@ sync problem is gone — there is nothing tracked that can drift (see ADR
 Test-infrastructure gaps verified **not implemented on `main`** and **not covered** by #3 / #4 / #38
 as of 2026-09-15. The proposed tracking home is listed per item.
 
-- **`msys2/setup-msys2` release caching** — only `ci.yml`'s publish-gate build job still runs
-  `update: true` (a full `pacman -Syu` every run; a cold MSYS2 toolchain install adds ~3 min). The
-  publish paths deliberately pin `update: false` (`pages.yml`, `build-and-upload.yml`): a mid-cycle
-  upgrade moved gcc 16.1.0 → 16.2.0 and the rebuilt `installer_win.exe` was falsely flagged by
-  Defender's ML the next day, so the AV scan gate — not `pacman -Syu` — is the enforcement.
-  `cache: true` on that one job would trade freshness for minutes. Home: #33 (pipeline automation)
-  or as CI polish under #4.
+- **`msys2/setup-msys2` release caching** — every Windows leg now pins `update: false` (`ci.yml`,
+  `pages.yml`, `build-and-upload.yml`): a mid-cycle toolchain upgrade moved gcc 16.1.0 → 16.2.0 and
+  the rebuilt `installer_win.exe` was falsely flagged by Defender's ML the next day, so the AV scan
+  gate — not `pacman -Syu` — is the enforcement. `cache: true` would trade freshness for minutes per
+  job (same trade the cached `-fanalyzer` leg already made, PRs #105/#106). Home: #33 (pipeline
+  automation) or as CI polish under #4.
 
 ### Resolved since the 2026-09-05 pass (kept for reference)
 
