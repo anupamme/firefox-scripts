@@ -18,6 +18,43 @@ import {warn} from './log.mjs';
 export const HASHES_FILE = 'hashes.json';
 
 /**
+ * The canonical hash-order comparator: case-insensitive comparison over UTF-8
+ * bytes — ASCII letters fold (primary key), and paths that fold equal but
+ * differ in case tie-break on the raw bytes, so the order is total and
+ * input-independent. Byte-exact mirror of cmp_path_ci() in
+ * installer/src/detect_browser.c (and compareHashOrder() in
+ * scriptsUpdater.sys.mjs); locale-independent — deliberately NOT
+ * String.prototype.localeCompare, whose order varies with the
+ * runtime/application locale and would silently diverge from the C twin (and
+ * across machines). The adversarial probe in installer/test/test_hash.mjs pins
+ * the contract (ADR 0002).
+ *
+ * Accepts plain strings, or `{relative}` / `{rel}` entry objects as used by
+ * computeDirectoryHash / computeFileSetHash.
+ *
+ * @param {string | {relative?: string; rel?: string}} a
+ * @param {string | {relative?: string; rel?: string}} b
+ * @returns {number} negative / 0 / positive, for Array.prototype.sort
+ */
+const FOLD_OFFSET = 'a'.charCodeAt(0) - 'A'.charCodeAt(0);
+function foldC(bytes) {
+  const out = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    out[i] = b >= 65 && b <= 90 ? b + FOLD_OFFSET : b;
+  }
+  return out;
+}
+export function compareCaseInsensitive(a, b) {
+  const sa = typeof a === 'string' ? a : (a.relative ?? a.rel);
+  const sb = typeof b === 'string' ? b : (b.relative ?? b.rel);
+  const folded = Buffer.compare(foldC(Buffer.from(sa, 'utf-8')), foldC(Buffer.from(sb, 'utf-8')));
+  if (folded !== 0) return folded;
+  if (sa === sb) return 0;
+  return Buffer.compare(Buffer.from(sa, 'utf-8'), Buffer.from(sb, 'utf-8'));
+}
+
+/**
  * Render a helper checksum sidecar: `<hex sha256> <filename>\n` — sha256sum -c
  * compatible (two spaces), and exactly the format the updater tab parses back
  * before executing a freshly downloaded helper (issue #33).
@@ -100,7 +137,7 @@ export function computeDirectoryHash(dirPath, patterns, extraFiles = []) {
   const sorted = [
     ...files.map(rel => ({relative: rel, fullPath: path.join(dirPath, rel)})),
     ...extraFiles.map(e => ({relative: e.rel, fullPath: e.absPath})),
-  ].sort((a, b) => a.relative.localeCompare(b.relative));
+  ].sort(compareCaseInsensitive);
 
   const hash = crypto.createHash('sha256');
 
@@ -143,7 +180,7 @@ export function collectDirEntries(dirPath, patterns, prefix, baseDir = dirPath, 
  * bumps the installer hash and triggers a rebuild.
  */
 export function computeFileSetHash(entries) {
-  const sorted = [...entries].sort((a, b) => a.rel.localeCompare(b.rel));
+  const sorted = [...entries].sort(compareCaseInsensitive);
   const hash = crypto.createHash('sha256');
   for (const {rel, absPath} of sorted) {
     hash.update(rel + '\n');
