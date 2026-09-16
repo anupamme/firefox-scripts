@@ -33,6 +33,7 @@ import {execFileSync} from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import {fileURLToPath} from 'url';
+import {GENERATED_FILES, generatedPath} from './generatedRegistry.mjs';
 import {
   effectiveConfig as effectiveUpdaterConfig,
   generateModule as generateUpdaterConfig,
@@ -110,42 +111,49 @@ export function buildRemoteUiCss() {
   );
 }
 
-const GENERATED = [
-  {
-    rel: 'core/chrome/utils/updater/updater-config.sys.mjs',
-    generate: () => generateUpdaterConfig(readUpdaterConfig()),
+// The generated-file list is owned by generatedRegistry.mjs (the same list the
+// publish hashes consult); only the generators live here. A new generated file
+// is added ONCE, in the registry, and every consumer (regeneration, clean, zip
+// re-add, hash extraFiles, scan excludes) follows — ADR 0008's trap is closed
+// mechanically by test/unit/generatedRegistry.test.mjs.
+const GENERATORS = {
+  'core/chrome/utils/updater/updater-config.sys.mjs': () =>
+    generateUpdaterConfig(readUpdaterConfig()),
+  'installer/src/_config.h': () =>
+    configHeader(fs.readFileSync(path.join(ROOT, 'config', 'installer.conf'), 'utf-8')),
+  'installer/src/resources.h': () => {
+    // Node version of embed.py — byte-identical output, no Python needed.
+    return execFileSync('node', [path.join(ROOT, 'installer', 'embed.mjs'), '--stdout'], {
+      encoding: 'utf-8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
   },
-  {
-    rel: 'installer/src/_config.h',
-    generate: () =>
-      configHeader(fs.readFileSync(path.join(ROOT, 'config', 'installer.conf'), 'utf-8')),
-  },
-  {
-    rel: 'installer/src/resources.h',
-    generate: () => {
-      // Node version of embed.py — byte-identical output, no Python needed.
-      return execFileSync('node', [path.join(ROOT, 'installer', 'embed.mjs'), '--stdout'], {
-        encoding: 'utf-8',
-        maxBuffer: 16 * 1024 * 1024,
-      });
-    },
-  },
-];
+};
+const GENERATED = GENERATED_FILES.filter(f => f.rel in GENERATORS).map(f => ({
+  rel: f.rel,
+  generate: GENERATORS[f.rel],
+}));
 
 // Gitignored updater-tab stylesheet — written to disk by createZip.mjs at
 // publish time so it ships inside updater-ui.zip.  Never tracked or committed:
 // it is regenerated on demand from the shared design system + updater tail.
-const PREVIEW = [
-  {
-    rel: 'tools/publish/remote-ui/updater.css',
-    generate: buildRemoteUiCss,
-  },
-];
+// Also registry-driven (the one PREVIEW member). Fail fast at load: every
+// registry file must have exactly one generator (GENERATORS above, or the
+// PREVIEW one below) — a future registry entry without one must surface as a
+// clear load-time error, not a TypeError inside regenerate() (ai-review
+// finding on this PR).
+const PREVIEW = GENERATED_FILES.filter(f => !(f.rel in GENERATORS)).map(f => {
+  if (f.rel !== 'tools/publish/remote-ui/updater.css') {
+    throw new Error(
+      `syncGeneratedFiles.mjs: registry file '${f.rel}' has no generator — add it to GENERATORS ` +
+        `here (or teach PREVIEW how to build it)`
+    );
+  }
+  return {rel: f.rel, generate: buildRemoteUiCss};
+});
 
-/** Absolute path of a generated file. */
-export function generatedPath(rel) {
-  return path.join(ROOT, rel);
-}
+/** Absolute path of a generated file. Re-exported from generatedRegistry.mjs. */
+export {generatedPath};
 
 /**
  * Remove the generated files (and the gitignored updater css) from disk.
