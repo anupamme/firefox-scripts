@@ -434,8 +434,7 @@ static void create_parent_dirs(const char *dst_path) {
     if (dir[0] == '\0') return; /* root-level dst: parent is / */
 
     char tmp[MAX_PATH_LEN];
-    strncpy(tmp, dir, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    snprintf(tmp, sizeof(tmp), "%s", dir);
     for (char *c = tmp + 1; *c; c++) {
         if (*c == '/') {
             *c = '\0';
@@ -563,8 +562,7 @@ static void create_parent_dirs(const char *dst_path) {
     if (dir[0] == '\0') return; /* root-level dst: parent is / */
 
     char tmp[MAX_PATH_LEN];
-    strncpy(tmp, dir, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    snprintf(tmp, sizeof(tmp), "%s", dir);
     for (char *c = tmp + 1; *c; c++) {
         if (*c == '/') {
             *c = '\0';
