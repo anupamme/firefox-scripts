@@ -1,0 +1,98 @@
+# .github/actions/pinned-msys2/action.yml — MSYS2 UCRT64 whose mingw packages
+# are the exact versions pinned in config/msys2-toolchain.json.
+#
+# Why not just `msys2/setup-msys2` with `update: false`: that skips the system
+# upgrade but still installs whatever versions the runner's package DB offers,
+# so gcc stayed 16.1.0-5 while binutils/crt/headers floated — and, worse, it
+# defaults to `path-type: minimal` and extracts MSYS2 somewhere of its own
+# choosing, so the mingw dir is never on the job PATH: the build's `make` was
+# MSYS2's while `gcc`/`ld`/`windres` came from the runner image's own toolchain.
+# The published Windows PEs are unsigned with a per-hash AV verdict (issue
+# #157), so that shadowing silently changed the shipped bytes — rebuilding the
+# flagged commit with the toolchain its log recorded differs by 2.7 KB of code
+# (docs/DEVELOPING.md → "Why a clean local scan does not clear a CI build").
+#
+# Four things make the pin real, and each is separate work:
+#
+#   1. locate    ask the msys2 shell where it actually is (its `cygpath -m /`)
+#                and export that as MSYS2_LOCATION + the two PATH dirs. Never
+#                assume C:\msys64: the bootstrap extracts elsewhere.
+#   2. install   pacman -U the pinned files over whatever the runner had (a
+#                deliberate downgrade when the mirror has moved on), then
+#                assert every pinned version is the installed one.
+#   3. PATH      those dirs go first for every later step — including the plain
+#                `shell: bash` steps that actually run the build — with the
+#                pinned UCRT64 dir ahead of /usr/bin. GITHUB_PATH lines take
+#                effect in REVERSE write order (the runner joins them reversed
+#                before prepending them to PATH), so /usr/bin is written first
+#                on purpose.
+#   4. provenance print which gcc/ld/windres/make the build shell resolves and
+#                the version each reports, and fail if any is not the pinned
+#                one. `pacman -Q` says what is installed; this says what
+#                compiles, and it lands in the log next to the artifact.
+#
+# `pnpm toolchain:local` extracts the same files into a project-local prefix so
+# a developer reproduces exactly those bytes on their own machine.
+
+name: Pinned MSYS2 toolchain
+description: >-
+  MSYS2 UCRT64 with the exact package versions from config/msys2-toolchain.json (located, installed
+  via pacman -U, first on PATH, then proven from the build shell)
+
+runs:
+  using: composite
+  steps:
+    - name: Set up MSYS2 (bootstrap)
+      # update: false — see pages.yml: a mid-cycle pacman -Syu swapped the
+      # toolchain and the rebuilt installer was falsely AV-flagged the next
+      # day. The bootstrap only provides the dependency closure; the pinned
+      # versions below replace it. Its PATH wiring is deliberately not relied on.
+      uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+      with:
+        msystem: UCRT64
+        update: false
+        install: >-
+          mingw-w64-ucrt-x86_64-gcc make
+
+    - name: Locate the install and pin PATH for later steps
+      shell: msys2 {0}
+      # The msys2 shell is the one thing here that knows where MSYS2 lives, and
+      # `cygpath` is the only reliable way to speak to the GitHub env files from
+      # it ($GITHUB_PATH is a Windows path, which this shell cannot open raw).
+      # Later steps inherit MSYS2_LOCATION and the PATH order from here.
+      # Consequence to expect in a run log: `shell: bash` steps now report
+      # `msys64\usr\bin\bash.EXE` instead of Git-Bash, since this shell's dirs
+      # precede the system PATH. The publish flow was verified end-to-end under
+      # it (build → zips → upload → VT gate); MSYS2's GNU tar is stricter than
+      # Git-Bash's bsdtar about drive-letter file arguments, which is why
+      # tools/ci/msys2Toolchain.mjs passes archive paths colon-free.
+      run: |
+        echo "MSYS2_LOCATION=$(cygpath -m /)" >> "$(cygpath -u "$GITHUB_ENV")"
+        echo "PINNED_TOOLCHAIN_PREFIX=$(cygpath -m "$MINGW_PREFIX/bin")" >> "$(cygpath -u "$GITHUB_ENV")"
+        # Order matters, and not in the obvious direction: GITHUB_PATH lines
+        # take effect in REVERSE write order (the runner collects them in file
+        # order and Handler.AddPrependPathToEnvironment joins them reversed
+        # before prepending). /usr/bin is written first so it ends up second —
+        # the pinned UCRT64 dir must win, because MSYS binutils also ships
+        # ld/as/windres in /usr/bin and would otherwise shadow the pinned ones.
+        cygpath -w /usr/bin >> "$(cygpath -u "$GITHUB_PATH")"
+        cygpath -w "$MINGW_PREFIX/bin" >> "$(cygpath -u "$GITHUB_PATH")"
+        echo "pinned toolchain first on PATH: $MINGW_PREFIX/bin, then /usr/bin"
+
+    - name: Install the pinned toolchain versions
+      shell: bash
+      # --install downloads (sha256-verified), pacman -U's and verifies in one
+      # step: a mirror that no longer serves a pinned file, or a version that
+      # would not stick, fails the job instead of quietly shipping different
+      # bytes than the pin describes. Runs in bash, not the msys2 shell: that
+      # shell's PATH drops the toolcache, so `node` is not found there
+      # (setup-msys2's `path-type: minimal` — learned from two red runs).
+      run: node tools/ci/msys2Toolchain.mjs --install
+
+    - name: Prove the build shell resolves the pinned toolchain
+      shell: bash
+      # Runs in the same shell flavor the build runs in, so this asserts what
+      # actually compiles — versions, digests, every other candidate on PATH and
+      # the directory the tools come from all land in the log beside the
+      # uploaded artifact.
+      run: node tools/ci/msys2Toolchain.mjs --provenance --require-root "$PINNED_TOOLCHAIN_PREFIX"
