@@ -159,6 +159,20 @@ export function parseJobs(text) {
         else jobs.get(current).with[wi[1]] = wi[2].trim();
         continue;
       }
+      // Continuation line: prettier wraps a long 10-space input value onto the
+      // next line at 12 spaces (e.g. `required:` split over two lines). Append
+      // it to the open scalar instead of treating it as an outdent — otherwise
+      // the classification lists silently lose their tail.
+      if (
+        withKey !== null &&
+        /^ {12}\S/.test(line) &&
+        withKey !== 'results' &&
+        withKey !== 'applicability'
+      ) {
+        jobs.get(current).with[withKey] =
+          `${jobs.get(current).with[withKey]} ${line.trim()}`.trim();
+        continue;
+      }
       withKey = null; // left the with block
     }
 
@@ -385,6 +399,7 @@ const CONTRACTS = [
       'updater': "needs.changes.outputs.updater == 'true'",
       'updater-waterfox':
         "needs.changes.outputs.updater == 'true' || needs.changes.outputs.core == 'true' || github.event_name == 'workflow_dispatch' && inputs.browser == 'waterfox'",
+      'core-lifecycle': "needs.changes.outputs.core == 'true'",
       'browser-matrix':
         "needs.changes.outputs.updater == 'true' || needs.changes.outputs.core == 'true' || github.event_name == 'workflow_dispatch' && inputs.browser != 'all'",
       'fork-portable':
@@ -396,6 +411,7 @@ const CONTRACTS = [
       'helper',
       'updater',
       'updater-waterfox',
+      'core-lifecycle',
       'browser-matrix',
       'fork-portable',
     ],
@@ -411,12 +427,133 @@ const CONTRACTS = [
   },
 ];
 
+/**
+ * Script-coverage contract (the `test:e2e:legacy` rule, 2026-09): every
+ * `test:*` npm script must be reachable from automation — a workflow step, the
+ * `lint` pipeline, another test script, or a unit-test import — or be listed in
+ * MANUAL_TEST_SCRIPTS with a reason. An unreferenced script is the exact
+ * failure mode PR #245 shipped: `test:e2e:legacy` existed but nothing ever ran
+ * it, so the legacy-chrome lifecycle it exercises was "tested" only on the
+ * author's machine.
+ *
+ * The reachability closure starts from .github/workflows + .github/actions
+ * texts and the package.json `lint`/`format` pipelines; every script a root (or
+ * an already-reachable script) invokes joins the surfaces, and a script
+ * invoking another script counts only once IT is reachable — an orphaned
+ * wrapper cannot launder its callee. Names match exactly (`test:foo` is not
+ * covered by `test:foo:bar`), YAML `#` comments are stripped, and explicit
+ * allowlist entries pass. Unit tests importing the underlying .mjs directly
+ * (e.g. manifest-lifecycle's helpers) do NOT count — the point is that the
+ * end-to-end script runs.
+ */
+export const MANUAL_TEST_SCRIPTS = new Map([
+  // test:e2e / :installer / :updater wrap the same scripts CI runs directly
+  // (e2e.yml invokes installer-e2e.mjs / updater-e2e.mjs itself); run.mjs is
+  // the local orchestrator. test:skills is the --skip-tests variant of the
+  // check-skills stage that pnpm lint runs in full.
+  ['test:e2e', 'local orchestrator — CI runs installer-e2e/updater-e2e directly'],
+  ['test:e2e:installer', 'local convenience — e2e.yml runs installer-e2e.mjs directly'],
+  ['test:e2e:updater', 'local convenience — e2e.yml runs updater-e2e.mjs directly'],
+  ['test:skills', 'frontmatter-only variant of the lint pipeline stage'],
+]);
+
+/**
+ * Collect every test:* script name from package.json and return the ones not
+ * reachable from automation (see the contract comment above for the closure
+ * rules).
+ *
+ * @param {{
+ *   pkg?: string;
+ *   workflowDir?: string;
+ *   readFileSync?: typeof fs.readFileSync;
+ * }} [opts]
+ *   injectable paths/readers for unit tests
+ * @returns {string[]} human-readable violations (empty = contract holds)
+ */
+export function checkTestScriptCoverage(opts = {}) {
+  const read = opts.readFileSync ?? fs.readFileSync;
+  const pkgPath = opts.pkg ?? path.join(REPO_ROOT, 'package.json');
+  const wfDir = opts.workflowDir ?? path.join(REPO_ROOT, '.github');
+  const errors = [];
+
+  let pkg;
+  try {
+    pkg = JSON.parse(read(pkgPath, 'utf8'));
+  } catch {
+    return ['package.json unreadable — cannot verify test script coverage'];
+  }
+  const testScripts = Object.keys(pkg.scripts ?? {}).filter(s => s.startsWith('test:'));
+
+  // Automation roots: every workflow/action file's text plus the lint and
+  // format pipelines — the entry points CI actually executes.
+  const roots = [];
+  const stack = [wfDir];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, {withFileTypes: true});
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else roots.push(read(p, 'utf8'));
+    }
+  }
+  roots.push(pkg.scripts?.lint ?? '', pkg.scripts?.format ?? '');
+
+  // Reachability closure (CodeRabbit, #250): a script's command text joins
+  // the surfaces only once the script itself is reachable from the roots, so
+  // an unreferenced wrapper cannot launder the script it invokes. Names match
+  // exactly — `test:foo` is not covered by a mention of `test:foo:bar` — and
+  // YAML `#` comments are stripped so a commented-out invocation never counts.
+  const allScripts = pkg.scripts ?? {};
+  const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Script names come from our own package.json (never external input) — the
+  // non-literal RegExp is exact-matching against an escaped literal.
+  const patterns = new Map(
+    Object.keys(allScripts).map(n => [
+      n,
+      // eslint-disable-next-line security/detect-non-literal-regexp -- names are our own package.json keys, escaped then exact-matched
+      new RegExp(`(?<![\\w:-])${escapeRe(n)}(?![\\w:-])`),
+    ])
+  );
+  const stripYamlComments = t => t.replace(/(^|\s)#[^\n]*/g, '$1');
+  const texts = roots.map(stripYamlComments);
+  const reachable = new Set();
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [name, pattern] of patterns) {
+      if (reachable.has(name)) continue;
+      if (texts.some(t => pattern.test(t))) {
+        reachable.add(name);
+        texts.push(stripYamlComments(String(allScripts[name])));
+        grew = true;
+      }
+    }
+  }
+
+  for (const script of testScripts) {
+    if (MANUAL_TEST_SCRIPTS.has(script)) continue;
+    if (!reachable.has(script)) {
+      errors.push(
+        `test script '${script}' is not reachable from any workflow, action, the lint/format pipelines, or a reachable script chain (and is not allowlisted) — wire it into CI (like test:e2e:legacy now is) or add it to MANUAL_TEST_SCRIPTS with a reason`
+      );
+    }
+  }
+  return errors;
+}
+
 export function main() {
   const errors = [];
   for (const contract of CONTRACTS) {
     const text = fs.readFileSync(path.join(REPO_ROOT, contract.file), 'utf-8');
     errors.push(...checkWorkflow(text, contract));
   }
+  errors.push(...checkTestScriptCoverage());
   if (errors.length > 0) {
     for (const e of errors) console.error(`✗ ${e}`);
     console.error(`\nGate contracts violated (${errors.length}).`);
